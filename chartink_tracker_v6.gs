@@ -1,15 +1,15 @@
 // =============================================================================
-// CHARTINK MULTI-SCAN TRACKER — Google Apps Script v5.0
+// CHARTINK MULTI-SCAN TRACKER — Google Apps Script v6.0
 // =============================================================================
-// CHANGES FROM v4:
-//  [NEW] installRecurringTrigger() — sets a FIXED every-10-min trigger that
-//        survives crashes, timeouts and sheet closes. Call ONCE from the menu.
-//  [NEW] showTriggerStatus() — shows all active triggers in a popup
-//  [IMPROVED] runAllScans() skips silently outside market hours — no noise
-//  [REMOVED] self-scheduling one-shot pattern (unreliable, breaks on crash)
-//  [FIX] Chartink rate-limit retry + session refresh every 3 scans (from v4)
-//  [FIX] getUi() try/catch everywhere (from v3)
-//  [FIX] Weekend / past-close guard (from v2)
+// CHANGES FROM v5:
+//  [NEW] ACTIVE_DATE_RANGES is now the PRIMARY schedule control
+//        - Empty []              → default Mon–Fri 9:15–15:30 IST behaviour
+//        - Populated with ranges → ONLY runs on those exact date ranges
+//          (weekday/weekend check is BYPASSED — you control it fully)
+//  [NEW] label field on each range — shown in Log and skip messages
+//  [NEW] showScheduleStatus() menu item — shows today's range match
+//  [IMPROVED] getRunScheduleStatus() returns active range label in log
+//  All v5 fixes retained (retry, session refresh, permanent trigger)
 // =============================================================================
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -17,6 +17,37 @@
 // ─────────────────────────────────────────────────────────────────────────────
 const CONFIG = {
 
+  // ── Active Date Ranges ────────────────────────────────────────────────────
+  //
+  //  HOW IT WORKS:
+  //  • Empty []   → scanner runs every Mon–Fri 9:15–15:30 IST (default)
+  //  • With dates → scanner ONLY runs on dates inside these ranges,
+  //                 within market hours. Weekday/weekend check is ignored.
+  //
+  //  FORMAT: { from: "YYYY-MM-DD", to: "YYYY-MM-DD", label: "any text" }
+  //
+  //  EXAMPLES:
+  //    Specific week  : { from: "2026-03-23", to: "2026-03-27", label: "March Week 4" }
+  //    Single day     : { from: "2026-03-25", to: "2026-03-25", label: "Budget Day" }
+  //    Expiry week    : { from: "2026-03-23", to: "2026-03-26", label: "March Expiry" }
+  //    Multiple ranges: add as many objects as needed, all active simultaneously
+  //
+  //  TO PAUSE SCANNING: comment out all ranges (or clear the array)
+  //  TO RESUME:         either add ranges OR leave array empty for Mon–Fri mode
+
+  ACTIVE_DATE_RANGES: [
+    // { from: "2026-03-16", to: "2026-03-20", label: "March Week 3" },
+    // { from: "2026-03-23", to: "2026-03-27", label: "March Week 4" },
+    // { from: "2026-03-30", to: "2026-04-03", label: "March Expiry Week" },
+  ],
+
+  // ── Market Hours (IST) ────────────────────────────────────────────────────
+  MARKET_START_HOUR:   9,
+  MARKET_START_MINUTE: 15,
+  MARKET_END_HOUR:    15,
+  MARKET_END_MINUTE:  30,
+
+  // ── Scans ─────────────────────────────────────────────────────────────────
   SCANS: {
     "S1 Ultra Daily":     `( {cash} (
         latest close > latest ema( close , 10 ) and
@@ -106,18 +137,10 @@ const CONFIG = {
   YF_SUFFIX:   ".NS",
   ALERT_EMAIL: "your@email.com",
 
-  MARKET_START_HOUR:   9,
-  MARKET_START_MINUTE: 15,   // NSE actually opens at 9:15
-  MARKET_END_HOUR:    15,
-  MARKET_END_MINUTE:  30,
+  // ── Trigger ───────────────────────────────────────────────────────────────
+  TRIGGER_INTERVAL_MINUTES: 10,   // valid GAS values: 1, 5, 10, 15, 30
 
-  ACTIVE_DATE_RANGES: [],    // [] = normal Mon–Fri mode
-
-  // ── Trigger ────────────────────────────────────────────────────────────
-  // Valid GAS values: 1, 5, 10, 15, 30
-  TRIGGER_INTERVAL_MINUTES: 10,
-
-  // ── Chartink rate-limit settings ───────────────────────────────────────
+  // ── Chartink rate-limit settings ─────────────────────────────────────────
   SCAN_SLEEP_MS:         3000,
   SCAN_RETRY_MAX:        3,
   SCAN_RETRY_BASE_MS:    3000,
@@ -202,79 +225,52 @@ const PRICE_COLS = [C.CAPTURE_PRICE,C.CURRENT_PRICE,C.MA20,C.MA50,C.MA200];
 // =============================================================================
 function onOpen() {
   SpreadsheetApp.getUi().createMenu("📈 Scanner")
-    .addItem("▶ Run Now (Manual)",           "runAllScans")
+    .addItem("▶ Run Now (Manual)",            "runAllScans")
     .addItem("🧪 Test All Scans (No Schedule)","testRunAllScans")
-    .addItem("🔬 Test Yahoo (RELIANCE)",      "testYahooFetch")
+    .addItem("🔬 Test Yahoo (RELIANCE)",       "testYahooFetch")
     .addSeparator()
-    .addItem("⚙️ Setup All Sheets",           "setupAllSheets")
+    .addItem("⚙️ Setup All Sheets",            "setupAllSheets")
     .addSeparator()
-    .addItem("📌 Install Recurring Trigger",  "installRecurringTrigger")
-    .addItem("📋 Show Trigger Status",        "showTriggerStatus")
-    .addItem("⏹ Stop All Triggers",          "stopAllTriggers")
+    .addItem("📌 Install Recurring Trigger",   "installRecurringTrigger")
+    .addItem("📋 Show Trigger Status",         "showTriggerStatus")
+    .addItem("📅 Show Schedule Status",        "showScheduleStatus")
+    .addItem("⏹ Stop All Triggers",           "stopAllTriggers")
     .addSeparator()
-    .addItem("📊 Conservative Profile",       "setConservativeProfile")
-    .addItem("📊 Balanced Profile",           "setBalancedProfile")
-    .addItem("📊 Aggressive Profile",         "setAggressiveProfile")
+    .addItem("📊 Conservative Profile",        "setConservativeProfile")
+    .addItem("📊 Balanced Profile",            "setBalancedProfile")
+    .addItem("📊 Aggressive Profile",          "setAggressiveProfile")
     .addSeparator()
-    .addItem("🗑 Clear Price History",        "clearPriceHistory")
+    .addItem("🗑 Clear Price History",         "clearPriceHistory")
     .addToUi();
 }
 
 // =============================================================================
-// TRIGGER MANAGEMENT  ← THE CORE FIX IN v5
+// TRIGGER MANAGEMENT
 // =============================================================================
-
-/**
- * installRecurringTrigger()
- * ─────────────────────────
- * Call this ONCE from the menu after pasting the script.
- * Creates a FIXED every-10-min time-based trigger for runAllScans().
- *
- * How it works:
- *  • GAS fires runAllScans() every 10 minutes, 24×7
- *  • runAllScans() checks market hours + weekday at the TOP
- *  • If outside hours → logs "⏭ Skipped" and returns immediately (< 1 sec)
- *  • If inside hours → runs all 6 scans + Yahoo + Dashboard
- *
- * You NEVER need to re-run this unless you call stopAllTriggers().
- * The trigger persists even when the spreadsheet is closed.
- */
 function installRecurringTrigger() {
-  // Delete any old runAllScans triggers first
   deleteTriggersByHandler("runAllScans");
-
-  // Valid everyMinutes values in GAS: 1, 5, 10, 15, 30
-  const validMins = [1, 5, 10, 15, 30];
-  const iv = validMins.reduce((p, c) =>
-    Math.abs(c - CONFIG.TRIGGER_INTERVAL_MINUTES) < Math.abs(p - CONFIG.TRIGGER_INTERVAL_MINUTES) ? c : p
+  const validMins = [1,5,10,15,30];
+  const iv = validMins.reduce((p,c) =>
+    Math.abs(c-CONFIG.TRIGGER_INTERVAL_MINUTES) < Math.abs(p-CONFIG.TRIGGER_INTERVAL_MINUTES) ? c : p
   );
-
-  ScriptApp.newTrigger("runAllScans")
-    .timeBased()
-    .everyMinutes(iv)
-    .create();
-
+  ScriptApp.newTrigger("runAllScans").timeBased().everyMinutes(iv).create();
+  const scheduleMode = CONFIG.ACTIVE_DATE_RANGES && CONFIG.ACTIVE_DATE_RANGES.length > 0
+    ? "Date ranges (" + CONFIG.ACTIVE_DATE_RANGES.length + " range(s) configured)"
+    : "Mon–Fri 9:15–15:30 IST (default)";
   const msg =
     "✅ Recurring trigger installed!\n\n" +
-    "• Fires every: " + iv + " minutes (24×7)\n" +
-    "• runAllScans() skips automatically outside market hours\n" +
-    "• Market window: Mon–Fri " +
+    "• Fires every:    " + iv + " minutes (24×7)\n" +
+    "• Schedule mode:  " + scheduleMode + "\n" +
+    "• Market window:  " +
       CONFIG.MARKET_START_HOUR + ":" + String(CONFIG.MARKET_START_MINUTE).padStart(2,"0") +
       " – " +
       CONFIG.MARKET_END_HOUR   + ":" + String(CONFIG.MARKET_END_MINUTE  ).padStart(2,"0") +
       " IST\n\n" +
-    "You can verify in:\n" +
-    "Apps Script editor → ⏰ Triggers (left sidebar)";
-
+    "Verify: Apps Script editor → ⏰ Triggers (left sidebar)";
   Logger.log(msg.replace(/\n/g," | "));
   try { SpreadsheetApp.getUi().alert(msg); } catch(_) {}
 }
 
-/**
- * showTriggerStatus()
- * ────────────────────
- * Shows all active project triggers in a popup.
- */
 function showTriggerStatus() {
   const triggers = ScriptApp.getProjectTriggers();
   if (!triggers.length) {
@@ -287,6 +283,41 @@ function showTriggerStatus() {
   });
   const msg = "Active Triggers (" + triggers.length + "):\n\n" + lines.join("\n");
   Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch(_) {}
+}
+
+/**
+ * showScheduleStatus()
+ * Shows today's date, which range it matches (if any), and whether
+ * the scanner would run right now.
+ */
+function showScheduleStatus() {
+  const ist    = new Date(new Date().toLocaleString("en-US",{timeZone:"Asia/Kolkata"}));
+  const today  = Utilities.formatDate(ist,"Asia/Kolkata","yyyy-MM-dd");
+  const status = getRunScheduleStatus();
+  const ranges = CONFIG.ACTIVE_DATE_RANGES;
+  let msg = "📅 Schedule Status\n\n";
+  msg += "Today (IST):  " + fmtIST(ist) + "\n";
+  msg += "Today Date:   " + today + "\n\n";
+  if (!ranges || ranges.length === 0) {
+    msg += "Mode: Default Mon–Fri\n";
+    msg += "Weekend:  " + ([0,6].includes(ist.getDay()) ? "Yes → skip" : "No → check hours") + "\n";
+  } else {
+    msg += "Mode: Date Ranges (" + ranges.length + " configured)\n\n";
+    msg += "Ranges:\n";
+    ranges.forEach(r => {
+      const active = today >= r.from && today <= r.to;
+      msg += "  " + (active ? "✅" : "⬜") + " " + r.from + " → " + r.to + "  [" + (r.label||"no label") + "]\n";
+    });
+  }
+  msg += "\nMarket window: " +
+    CONFIG.MARKET_START_HOUR+":"+String(CONFIG.MARKET_START_MINUTE).padStart(2,"0") +
+    " – " +
+    CONFIG.MARKET_END_HOUR+":"+String(CONFIG.MARKET_END_MINUTE).padStart(2,"0") + " IST\n\n";
+  msg += status.isLiveWindow
+    ? "▶ STATUS: RUNNING ✅  (scanner would fire right now)"
+    : "⏸ STATUS: SKIPPED ⬜  Reason: " + status.reason;
+  Logger.log(msg.replace(/\n/g," | "));
   try { SpreadsheetApp.getUi().alert(msg); } catch(_) {}
 }
 
@@ -303,23 +334,86 @@ function deleteTriggersByHandler(name) {
 }
 
 // =============================================================================
-// MAIN ENTRY — called by the recurring trigger every 10 min
+// SCHEDULE CHECK  ← CORE CHANGE IN v6
+// =============================================================================
+/**
+ * getRunScheduleStatus()
+ *
+ * Returns { isLiveWindow: bool, reason: string, label: string }
+ *
+ * Logic:
+ *   IF ACTIVE_DATE_RANGES is empty []
+ *     → Mon–Fri only + market hours check (original behaviour)
+ *   ELSE
+ *     → Date must be inside at least one range + market hours check
+ *       Weekend/weekday is IGNORED — the ranges fully control dates
+ *
+ * The `label` of the matching range is included in log messages.
+ */
+function getRunScheduleStatus() {
+  const ist      = new Date(new Date().toLocaleString("en-US",{timeZone:"Asia/Kolkata"}));
+  const h        = ist.getHours();
+  const m        = ist.getMinutes();
+  const nowVal   = h * 60 + m;
+  const startVal = CONFIG.MARKET_START_HOUR   * 60 + CONFIG.MARKET_START_MINUTE;
+  const endVal   = CONFIG.MARKET_END_HOUR     * 60 + CONFIG.MARKET_END_MINUTE;
+  const ranges   = CONFIG.ACTIVE_DATE_RANGES;
+
+  // ── Mode A: Date range mode ───────────────────────────────────────────────
+  if (ranges && ranges.length > 0) {
+    const today      = Utilities.formatDate(ist,"Asia/Kolkata","yyyy-MM-dd");
+    const matchRange = ranges.find(r => today >= r.from && today <= r.to);
+
+    if (!matchRange) {
+      // Build a helpful "next range" hint
+      const upcoming = ranges
+        .filter(r => r.from > today)
+        .sort((a,b) => a.from.localeCompare(b.from));
+      const hint = upcoming.length
+        ? " — next active: " + upcoming[0].from + " [" + (upcoming[0].label||"") + "]"
+        : " — no upcoming ranges configured";
+      return { isLiveWindow:false, reason:"Date " + today + " not in any active range" + hint, label:"" };
+    }
+
+    // Date matched — now check market hours
+    if (nowVal < startVal)
+      return { isLiveWindow:false, reason:"Before market open  [" + matchRange.label + "]", label:matchRange.label||"" };
+    if (nowVal > endVal)
+      return { isLiveWindow:false, reason:"After market close  [" + matchRange.label + "]", label:matchRange.label||"" };
+
+    return { isLiveWindow:true, reason:"", label:matchRange.label||"" };
+  }
+
+  // ── Mode B: Default Mon–Fri mode ─────────────────────────────────────────
+  const day = ist.getDay();
+  if (day === 0 || day === 6)
+    return { isLiveWindow:false, reason:"Weekend", label:"" };
+  if (nowVal < startVal)
+    return { isLiveWindow:false, reason:"Before market open", label:"" };
+  if (nowVal > endVal)
+    return { isLiveWindow:false, reason:"After market close", label:"" };
+
+  return { isLiveWindow:true, reason:"", label:"" };
+}
+
+// =============================================================================
+// MAIN ENTRY — called by recurring trigger every 10 min
 // =============================================================================
 function runAllScans() {
   const ss       = SpreadsheetApp.getActiveSpreadsheet();
   const schedule = getRunScheduleStatus();
   if (!schedule.isLiveWindow) {
-    // Silent skip outside market hours — no log spam
     Logger.log("⏭ Skipped — " + schedule.reason);
     return;
   }
   ensureSystemSheets(ss);
-  log(ss, "▶ AUTO RUN STARTED — " + fmtIST(new Date()));
+  const rangeTag = schedule.label ? "  [" + schedule.label + "]" : "";
+  log(ss, "▶ AUTO RUN STARTED — " + fmtIST(new Date()) + rangeTag);
   _doRun(ss, "AUTO");
 }
 
 // =============================================================================
-// TEST RUN — bypasses schedule, works from editor + sheet menu
+// TEST RUN — bypasses schedule
 // =============================================================================
 function testRunAllScans() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -350,7 +444,6 @@ function _doRun(ss, mode) {
   const globalSymMap = {};
   const scanNames    = Object.keys(CONFIG.SCANS);
 
-  // ── 1. Initial Chartink session ──────────────────────────────────────────
   let session = null;
   try {
     session = fetchChartinkSession();
@@ -360,48 +453,32 @@ function _doRun(ss, mode) {
     return { elapsed:"0", scanCount:0, uniqueStocks:0, highConviction:0, godMode:[] };
   }
 
-  // ── 2. Run scans with retry + proactive session refresh ──────────────────
   for (let si = 0; si < scanNames.length; si++) {
     if (isTimedOut(RUN_START)) { log(ss, "⏱ Timeout — skipping remaining scans"); break; }
-
     const scanName = scanNames[si];
     const clause   = CONFIG.SCANS[scanName];
-
-    // Proactively refresh session every N scans
     if (si > 0 && si % CONFIG.SESSION_REFRESH_EVERY === 0) {
       try {
         session = fetchChartinkSession();
         log(ss, "  🔄 Session refreshed at scan " + (si+1) + " — token: " + session.token.slice(0,12) + "…");
-      } catch(e) {
-        log(ss, "  ⚠️ Session refresh failed: " + e.message);
-      }
+      } catch(e) { log(ss, "  ⚠️ Session refresh failed: " + e.message); }
     }
-
     if (si > 0) Utilities.sleep(CONFIG.SCAN_SLEEP_MS + jitter());
-
-    // Retry loop
     let stocks = null, lastErr = "";
     for (let attempt = 1; attempt <= CONFIG.SCAN_RETRY_MAX; attempt++) {
-      try {
-        stocks = callChartinkScan(clause, session.token, session.cookieHeader);
-        break;
-      } catch(e) {
+      try { stocks = callChartinkScan(clause, session.token, session.cookieHeader); break; }
+      catch(e) {
         lastErr = e.message;
         log(ss, "  ⚠️ " + scanName + " attempt " + attempt + "/" + CONFIG.SCAN_RETRY_MAX + ": " + lastErr);
         if (attempt < CONFIG.SCAN_RETRY_MAX) {
           const backoffMs = CONFIG.SCAN_RETRY_BASE_MS * Math.pow(2, attempt-1) + jitter();
           log(ss, "  🔁 Retrying in " + (backoffMs/1000).toFixed(1) + "s — refreshing session…");
           Utilities.sleep(backoffMs);
-          try {
-            session = fetchChartinkSession();
-            log(ss, "  🔄 Session refreshed for retry — token: " + session.token.slice(0,12) + "…");
-          } catch(re) {
-            log(ss, "  ⚠️ Session refresh on retry failed: " + re.message);
-          }
+          try { session = fetchChartinkSession(); log(ss, "  🔄 Session refreshed for retry — token: " + session.token.slice(0,12) + "…"); }
+          catch(re) { log(ss, "  ⚠️ Session refresh on retry failed: " + re.message); }
         }
       }
     }
-
     if (stocks === null) {
       log(ss, "  ❌ " + scanName + ": all retries exhausted — " + lastErr);
       allResults[scanName] = [];
@@ -413,29 +490,23 @@ function _doRun(ss, mode) {
     }
   }
 
-  // ── 3. GOD MODE (S5A ∩ S5B) ─────────────────────────────────────────────
   const s5aSet  = new Set((allResults["S5A GOD DailyWeekly"]  || []).map(s => s.nsecode));
   const s5bSet  = new Set((allResults["S5B GOD DailyMonthly"] || []).map(s => s.nsecode));
   const godMode = [...s5aSet].filter(s => s5bSet.has(s));
   log(ss, "★ GOD MODE: " + (godMode.length ? godMode.join(", ") : "none"));
 
-  // ── 4. Per-scan sheets + Yahoo ────────────────────────────────────────────
   const allNewStocks = [];
   for (const [scanName, stocks] of Object.entries(allResults)) {
     if (isTimedOut(RUN_START)) { log(ss, "⏱ Timeout — skipping performance updates"); break; }
     try {
       const newOnes = processScanSheet(ss, scanName, stocks, globalSymMap, RUN_START);
       if (newOnes.length) allNewStocks.push({ scan: scanName, stocks: newOnes });
-    } catch(e) {
-      log(ss, "  ❌ processScanSheet [" + scanName + "]: " + e.message);
-    }
+    } catch(e) { log(ss, "  ❌ processScanSheet [" + scanName + "]: " + e.message); }
   }
 
-  // ── 5. GOD MODE sheet + Dashboard ────────────────────────────────────────
   updateGodModeSheet(ss, godMode, allResults, globalSymMap);
   if (!isTimedOut(RUN_START)) updateDashboard(ss, allResults, globalSymMap, godMode);
 
-  // ── 6. Email (AUTO only) ─────────────────────────────────────────────────
   if (mode !== "TEST" && CONFIG.ALERT_EMAIL &&
       (godMode.length > 0 || allNewStocks.length > 0)) {
     try { sendEmailAlert(godMode, allNewStocks, globalSymMap); } catch(_) {}
@@ -447,7 +518,7 @@ function _doRun(ss, mode) {
   log(ss, (mode==="TEST"?"🧪":"✅") + " " + mode + " complete — "
          + elapsed + "s | stocks: " + uniqueStocks
          + " | GOD MODE: " + godMode.length + " | HC: " + hcCount);
-  return { elapsed, scanCount: Object.keys(allResults).length, uniqueStocks, highConviction:hcCount, godMode };
+  return { elapsed, scanCount:Object.keys(allResults).length, uniqueStocks, highConviction:hcCount, godMode };
 }
 
 function jitter() {
@@ -762,7 +833,7 @@ function roundN(v,n){if(v==null||isNaN(v))return "";return Math.round(v*Math.pow
 function pct(v){if(v==null||isNaN(v))return "";return Math.round(v*100)/100;}
 
 // =============================================================================
-// SIGNAL ENGINE (13 tiers)
+// SIGNAL ENGINE
 // =============================================================================
 function getSignalSettings(){
   const stored=PropertiesService.getScriptProperties().getProperty(SIGNAL_PROFILE_KEY);
@@ -956,19 +1027,31 @@ function updateDashboard(ss,allResults,globalSymMap,godMode){
   const hdr=(text,bg,fg)=>{sh.getRange(r,1,1,8).merge().setValue(text).setBackground(bg||"#333").setFontColor(fg||"#FFF").setFontWeight("bold").setFontSize(11);r++;};
   const rowHdr=(cols,bg)=>{sh.getRange(r,1,1,cols.length).setValues([cols]).setFontWeight("bold").setBackground(bg||"#E0E0E0");r++;};
   const dataRow=(vals,bg)=>{sh.getRange(r,1,1,vals.length).setValues([vals]);if(bg)sh.getRange(r,1,1,vals.length).setBackground(bg);r++;};
-  sh.getRange(r,1,1,8).merge().setValue("CHARTINK BULLISH SCREENER  |  "+fmtIST(new Date())).setBackground("#1A237E").setFontColor("#FFF").setFontWeight("bold").setFontSize(12);r++;r++;
+
+  // Schedule info banner
+  const schedule=getRunScheduleStatus();
+  const modeLabel=CONFIG.ACTIVE_DATE_RANGES&&CONFIG.ACTIVE_DATE_RANGES.length>0
+    ? "📅 Date Range Mode"
+    : "📅 Mon–Fri Mode";
+  sh.getRange(r,1,1,8).merge()
+    .setValue("CHARTINK BULLISH SCREENER  |  "+fmtIST(new Date())+"  |  "+modeLabel+(schedule.label?" — "+schedule.label:""))
+    .setBackground("#1A237E").setFontColor("#FFF").setFontWeight("bold").setFontSize(12);
+  r++;r++;
+
   hdr("★ GOD MODE — All 3 Timeframes  ("+godMode.length+" stocks)","#B71C1C");
   if(godMode.length){
     rowHdr(["Symbol","Name","Close ₹","Chng %","Scans","Status"],"#FFD700");
     const s5a=allResults["S5A GOD DailyWeekly"]||[];
     godMode.forEach(sym=>{const s=s5a.find(x=>x.nsecode===sym);if(s)dataRow([s.nsecode,s.name,parseFloat(s.close)||"",parseFloat(s.per_chg)||"",(globalSymMap[sym]||1)+"/6","★ GOD MODE"],"#FFF9C4");});
   } else {sh.getRange(r,1).setValue("None today").setFontColor("#888");r++;}r++;
+
   const hc=Object.entries(globalSymMap).filter(([,c])=>c>=3).sort(([,a],[,b])=>b-a);
   hdr("HIGH CONVICTION — 3+ Scans ("+hc.length+" stocks)","#1B5E20");
   if(hc.length){
     rowHdr(["Symbol","Name","Close ₹","Chng %","Scans Matched"],"#A5D6A7");
     hc.forEach(([sym,cnt])=>{const flat=Object.values(allResults).flat(),s=flat.find(x=>x.nsecode===sym);if(s)dataRow([s.nsecode,s.name,parseFloat(s.close)||"",parseFloat(s.per_chg)||"",cnt+"/6"],"#E8F5E9");});
   } else {sh.getRange(r,1).setValue("None today").setFontColor("#888");r++;}r++;
+
   for(const[name,stocks]of Object.entries(allResults)){
     hdr(name+"  ("+stocks.length+" stocks)","#37474F");
     if(!stocks.length){sh.getRange(r,1).setValue("No matches").setFontColor("#AAA");r++;}
@@ -991,25 +1074,6 @@ function sendEmailAlert(godMode,allNewStocks,globalSymMap){
   if(allNewStocks.length)body+="NEW STOCKS:\n"+allNewStocks.map(({scan,stocks})=>scan+": "+stocks.map(s=>s.nsecode).join(", ")).join("\n")+"\n";
   body+="\nOpen your sheet for full details.";
   MailApp.sendEmail({to:CONFIG.ALERT_EMAIL,subject,body});
-}
-
-// =============================================================================
-// SCHEDULE CHECK
-// =============================================================================
-function getRunScheduleStatus(){
-  const ist=new Date(new Date().toLocaleString("en-US",{timeZone:"Asia/Kolkata"}));
-  const day=ist.getDay(),h=ist.getHours(),m=ist.getMinutes();
-  const nowVal=h*60+m,startVal=CONFIG.MARKET_START_HOUR*60+CONFIG.MARKET_START_MINUTE,endVal=CONFIG.MARKET_END_HOUR*60+CONFIG.MARKET_END_MINUTE;
-  if(CONFIG.ACTIVE_DATE_RANGES&&CONFIG.ACTIVE_DATE_RANGES.length>0){
-    const today=Utilities.formatDate(ist,"Asia/Kolkata","yyyy-MM-dd");
-    const inRange=CONFIG.ACTIVE_DATE_RANGES.some(r=>today>=r.from&&today<=r.to);
-    if(!inRange)return{isLiveWindow:false,reason:"Outside configured date ranges"};
-  } else {
-    if(day===0||day===6)return{isLiveWindow:false,reason:"Weekend"};
-  }
-  if(nowVal<startVal)return{isLiveWindow:false,reason:"Before market open"};
-  if(nowVal>endVal)  return{isLiveWindow:false,reason:"After market close"};
-  return{isLiveWindow:true};
 }
 
 // =============================================================================
